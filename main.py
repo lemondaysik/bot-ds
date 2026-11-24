@@ -20,8 +20,15 @@ DB_PATH = os.getenv("DB_PATH", "bot.db")
 MAX_MESSAGE_LEN = 2000
 DEFAULT_MUTE_MINUTES = 10
 
+
 WARN_LIMIT_FOR_MUTE = 3     
 WARN_MUTE_DURATION = "2h"   
+
+ROLE_DOTA_ID = 1574752648312389662
+ROLE_CS2_ID = 1574752702125047828
+ROLE_DEADLOCK_ID = 1574752814352048180
+
+RR_REPLY_ROLE_ID = 1572630321680224347
 
 log = logging.getLogger("bot")
 log.setLevel(logging.INFO)
@@ -38,6 +45,7 @@ log.addHandler(fh)
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.presences = True 
 
 bot = commands.Bot(
     command_prefix="!",
@@ -105,7 +113,6 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_mutes_user ON mutes(guild_id, user_id, active);
 
-            -- НОВАЯ ТАБЛИЦА ДЛЯ ВАРНОВ
             CREATE TABLE IF NOT EXISTS warnings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id INTEGER NOT NULL,
@@ -116,6 +123,14 @@ class Database:
                 active INTEGER NOT NULL DEFAULT 1
             );
             CREATE INDEX IF NOT EXISTS idx_warnings_user ON warnings(guild_id, user_id, active);
+
+            CREATE TABLE IF NOT EXISTS status_roles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                trigger_text TEXT NOT NULL,
+                role_id INTEGER NOT NULL,
+                type TEXT NOT NULL DEFAULT 'any'
+            );
         """)
         await self._conn.commit()
         log.info("БД готова: %s", self.path)
@@ -234,7 +249,6 @@ class Database:
         ) as cur:
             return await cur.fetchall()
 
-
     async def mute_add(self, guild_id, user_id, mod_id, reason, expires_at: Optional[datetime]):
         await self._conn.execute(
             "INSERT INTO mutes(guild_id, user_id, moderator_id, reason, created_at, expires_at) "
@@ -274,7 +288,6 @@ class Database:
         ) as cur:
             return await cur.fetchall()
 
-    # ----- ВАРНЫ -----
     async def warn_add(self, guild_id, user_id, mod_id, reason):
         await self._conn.execute(
             "INSERT INTO warnings(guild_id, user_id, moderator_id, reason, created_at) "
@@ -309,6 +322,21 @@ class Database:
             "UPDATE warnings SET active = 0 WHERE guild_id = ? AND user_id = ? AND active = 1",
             (guild_id, user_id),
         )
+        await self._conn.commit()
+
+    async def status_role_add(self, guild_id, trigger_text, role_id):
+        await self._conn.execute(
+            "INSERT INTO status_roles(guild_id, trigger_text, role_id, type) VALUES (?, ?, ?, 'any')",
+            (guild_id, trigger_text.lower(), role_id)
+        )
+        await self._conn.commit()
+
+    async def status_roles_list(self, guild_id):
+        async with self._conn.execute("SELECT * FROM status_roles WHERE guild_id = ?", (guild_id,)) as cur:
+            return await cur.fetchall()
+
+    async def status_role_remove(self, guild_id, role_id):
+        await self._conn.execute("DELETE FROM status_roles WHERE guild_id = ? AND role_id = ?", (guild_id, role_id))
         await self._conn.commit()
 
 
@@ -382,6 +410,14 @@ async def on_ready():
     check_expirations.start()
     check_scheduled.start()
     log.info(f"Бот {bot.user} (id={bot.user.id}) готов. Гильдий: {len(bot.guilds)}")
+    
+    for guild in bot.guilds:
+        rules = await db.status_roles_list(guild.id)
+        if not rules:
+            await db.status_role_add(guild.id, "dota", ROLE_DOTA_ID)
+            await db.status_role_add(guild.id, "counter-strike 2", ROLE_CS2_ID)
+            await db.status_role_add(guild.id, "deadlock", ROLE_DEADLOCK_ID)
+            log.info(f"Созданы базовые правила статус-ролей для сервера {guild.name}")
 
 
 @bot.event
@@ -404,8 +440,6 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         await ctx.reply(f"Ошибка: `{type(error).__name__}`.")
 
 
-RR_REPLY_ROLE_ID = 1572630321680224347
-
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -413,11 +447,64 @@ async def on_message(message: discord.Message):
 
     if re.search(r'\bRR\b', message.content, re.IGNORECASE):
         has_role = any(role.id == RR_REPLY_ROLE_ID for role in message.author.roles)
-        if not has_role:
+        if has_role:
+            await message.reply("Маладес вась")
+        else:
             await message.reply("Пошел нахуй если не шаришь")
 
     await bot.process_commands(message)
 
+
+@bot.event
+async def on_presence_update(before: discord.Member, after: discord.Member):
+    if after.bot or not after.guild: return
+    
+    rules = await db.status_roles_list(after.guild.id)
+    if not rules: return
+
+    user_triggers = set()
+    for activity in after.activities:
+        if isinstance(activity, discord.CustomActivity) and activity.name:
+            user_triggers.add(activity.name.lower())
+        elif isinstance(activity, discord.Game) or (isinstance(activity, discord.Activity) and activity.type == discord.ActivityType.playing):
+            user_triggers.add(activity.name.lower())
+
+    for rule in rules:
+        role = after.guild.get_role(rule["role_id"])
+        if not role: continue 
+        
+        should_have = any(rule["trigger_text"] in trigger for trigger in user_triggers)
+        has_role = role in after.roles
+        
+        try:
+            if should_have and not has_role:
+                await after.add_roles(role, reason="Авто-роль по статусу")
+                log.info(f"Выдана роль {role.name} пользователю {after.name} за статус.")
+            elif not should_have and has_role:
+                await after.remove_roles(role, reason="Снятие авто-роли по статусу")
+                log.info(f"Снята роль {role.name} с {after.name} (статус пропал).")
+        except discord.Forbidden:
+            log.warning(f"Нет прав для выдачи/снятия роли {role.name} у {after.name}")
+
+
+@bot.hybrid_command(name="statusrole", description="Добавить авто-роль по статусу")
+@commands.guild_only()
+@is_allowed()
+async def statusrole_cmd(ctx: commands.Context, action: str, trigger: str, role: discord.Role = None):
+    if action.lower() == "add":
+        if not role:
+            await ctx.reply("Укажи роль! Пример: `!statusrole add \"Dota 2\" @Дота_Игрок`")
+            return
+        await db.status_role_add(ctx.guild.id, trigger.strip('"'), role.id)
+        await ctx.reply(f"✅ Добавлено правило: если статус содержит **«{trigger.strip('\"')}»**, выдать роль {role.mention}.")
+    elif action.lower() == "remove":
+        if not role:
+            await ctx.reply("Укажи роль! Пример: `!statusrole remove @Дота_Игрок`")
+            return
+        await db.status_role_remove(ctx.guild.id, role.id)
+        await ctx.reply(f"🗑 Правило для роли {role.mention} удалено.")
+    else:
+        await ctx.reply("Неизвестное действие. Используй `add` или `remove`.")
 
 @tasks.loop(seconds=30)
 async def check_scheduled():
@@ -457,8 +544,7 @@ async def check_expirations():
             guild = bot.get_guild(row["guild_id"])
             if guild:
                 try:
-                    await guild.unban(discord.Object(id=row["user_id"]),
-                                      reason="Истёк срок бана")
+                    await guild.unban(discord.Object(id=row["user_id"]), reason="Истёк срок бана")
                 except discord.NotFound:
                     pass
                 except Exception:
@@ -497,9 +583,7 @@ async def send_cmd(ctx: commands.Context, channel: discord.TextChannel, *, text:
             for part in parts:
                 msg = await channel.send(
                     part,
-                    allowed_mentions=discord.AllowedMentions(
-                        everyone=False, roles=False, users=True
-                    ),
+                    allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
                 )
                 sent_ids.append(msg.id)
         except discord.Forbidden:
@@ -518,18 +602,9 @@ async def send_cmd(ctx: commands.Context, channel: discord.TextChannel, *, text:
 @bot.hybrid_command(name="sendembed", description="Отправить embed в канал")
 @commands.guild_only()
 @is_allowed()
-async def send_embed(
-    ctx: commands.Context,
-    channel: discord.TextChannel,
-    title: str,
-    *,
-    description: str = "",
-):
+async def send_embed(ctx: commands.Context, channel: discord.TextChannel, title: str, *, description: str = ""):
     embed = discord.Embed(
-        title=title,
-        description=description or None,
-        color=discord.Color.blurple(),
-        timestamp=discord.utils.utcnow(),
+        title=title, description=description or None, color=discord.Color.blurple(), timestamp=discord.utils.utcnow()
     )
     embed.set_footer(text=f"Отправлено: {ctx.author.display_name}")
     try:
@@ -553,8 +628,7 @@ async def say_cmd(ctx: commands.Context, *, text: str):
     for part in split_message(text):
         msg = await ctx.send(part, allowed_mentions=discord.AllowedMentions.none())
         sent_ids.append(msg.id)
-    await db.audit_add(ctx.author.id, ctx.channel.id, ctx.guild.id, text,
-                       sent_ids[0] if sent_ids else None)
+    await db.audit_add(ctx.author.id, ctx.channel.id, ctx.guild.id, text, sent_ids[0] if sent_ids else None)
 
 
 @bot.hybrid_command(name="ping", description="Проверить задержку бота")
@@ -611,9 +685,7 @@ async def scheduled_list(ctx: commands.Context):
         ch = bot.get_channel(row["channel_id"])
         ch_mention = ch.mention if ch else f"`{row['channel_id']}`"
         preview = row["content"][:40] + ("…" if len(row["content"]) > 40 else "")
-        lines.append(
-            f"`#{row['id']}` → {ch_mention} — {fmt_dt(row['send_at'])} — «{preview}»"
-        )
+        lines.append(f"`#{row['id']}` → {ch_mention} — {fmt_dt(row['send_at'])} — «{preview}»")
     await ctx.reply("\n".join(lines))
 
 
@@ -636,7 +708,6 @@ async def unschedule_cmd(ctx: commands.Context, schedule_id: int):
 @is_allowed()
 async def stats_cmd(ctx: commands.Context):
     total, top_channels, top_authors = await db.audit_stats(ctx.guild.id)
-
     lines = [f"**Всего отправлено сообщений через бота:** {total}"]
 
     if top_channels:
