@@ -1,5 +1,6 @@
 import os
 import asyncio
+import re
 import logging
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
@@ -18,6 +19,9 @@ DB_PATH = os.getenv("DB_PATH", "bot.db")
 
 MAX_MESSAGE_LEN = 2000
 DEFAULT_MUTE_MINUTES = 10
+
+WARN_LIMIT_FOR_MUTE = 3     
+WARN_MUTE_DURATION = "2h"   
 
 log = logging.getLogger("bot")
 log.setLevel(logging.INFO)
@@ -54,7 +58,6 @@ class Database:
         await self._conn.executescript("""
             PRAGMA journal_mode=WAL;
 
-            -- Аудит отправленных сообщений
             CREATE TABLE IF NOT EXISTS audit (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 author_id INTEGER NOT NULL,
@@ -67,7 +70,6 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_audit_author ON audit(author_id);
             CREATE INDEX IF NOT EXISTS idx_audit_channel ON audit(channel_id);
 
-            -- Отложенные сообщения
             CREATE TABLE IF NOT EXISTS scheduled (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 author_id INTEGER NOT NULL,
@@ -79,7 +81,6 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_sched_time ON scheduled(send_at, sent);
 
-            -- Баны
             CREATE TABLE IF NOT EXISTS bans (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id INTEGER NOT NULL,
@@ -92,7 +93,6 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_bans_user ON bans(guild_id, user_id, active);
 
-            -- Муты
             CREATE TABLE IF NOT EXISTS mutes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id INTEGER NOT NULL,
@@ -104,6 +104,18 @@ class Database:
                 active INTEGER NOT NULL DEFAULT 1
             );
             CREATE INDEX IF NOT EXISTS idx_mutes_user ON mutes(guild_id, user_id, active);
+
+            -- НОВАЯ ТАБЛИЦА ДЛЯ ВАРНОВ
+            CREATE TABLE IF NOT EXISTS warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                moderator_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE INDEX IF NOT EXISTS idx_warnings_user ON warnings(guild_id, user_id, active);
         """)
         await self._conn.commit()
         log.info("БД готова: %s", self.path)
@@ -262,6 +274,43 @@ class Database:
         ) as cur:
             return await cur.fetchall()
 
+    # ----- ВАРНЫ -----
+    async def warn_add(self, guild_id, user_id, mod_id, reason):
+        await self._conn.execute(
+            "INSERT INTO warnings(guild_id, user_id, moderator_id, reason, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (guild_id, user_id, mod_id, reason, datetime.now(timezone.utc).isoformat()),
+        )
+        await self._conn.commit()
+
+    async def warns_active(self, guild_id, user_id):
+        async with self._conn.execute(
+            "SELECT * FROM warnings WHERE guild_id = ? AND user_id = ? AND active = 1 "
+            "ORDER BY id DESC", (guild_id, user_id)
+        ) as cur:
+            return await cur.fetchall()
+
+    async def warns_count(self, guild_id, user_id) -> int:
+        async with self._conn.execute(
+            "SELECT COUNT(*) as c FROM warnings WHERE guild_id = ? AND user_id = ? AND active = 1",
+            (guild_id, user_id)
+        ) as cur:
+            return (await cur.fetchone())["c"]
+
+    async def warn_remove(self, guild_id, user_id, warn_id):
+        await self._conn.execute(
+            "UPDATE warnings SET active = 0 WHERE id = ? AND guild_id = ? AND user_id = ?",
+            (warn_id, guild_id, user_id),
+        )
+        await self._conn.commit()
+
+    async def warns_clear(self, guild_id, user_id):
+        await self._conn.execute(
+            "UPDATE warnings SET active = 0 WHERE guild_id = ? AND user_id = ? AND active = 1",
+            (guild_id, user_id),
+        )
+        await self._conn.commit()
+
 
 db = Database(DB_PATH)
 
@@ -295,7 +344,6 @@ def split_message(text: str, limit: int = MAX_MESSAGE_LEN) -> list[str]:
 
 
 def parse_duration(s: str) -> Optional[timedelta]:
-    """Парсит '10m', '2h', '1d', '30s', '1w'. Возвращает None при ошибке."""
     if not s:
         return None
     s = s.strip().lower()
@@ -354,6 +402,21 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     else:
         log.exception("Необработанная ошибка команды", exc_info=error)
         await ctx.reply(f"Ошибка: `{type(error).__name__}`.")
+
+
+RR_REPLY_ROLE_ID = 1572630321680224347
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    if re.search(r'\bRR\b', message.content, re.IGNORECASE):
+        has_role = any(role.id == RR_REPLY_ROLE_ID for role in message.author.roles)
+        if not has_role:
+            await message.reply("Пошел нахуй если не шаришь")
+
+    await bot.process_commands(message)
 
 
 @tasks.loop(seconds=30)
@@ -804,6 +867,86 @@ async def mutehistory_cmd(ctx: commands.Context, member: discord.Member, limit: 
             f"мод: <@{row['moderator_id']}> — до {fmt_dt(row['expires_at'])}"
         )
     await ctx.reply("\n".join(lines))
+
+
+@bot.hybrid_command(name="warn", description="Выдать предупреждение: !warn <юзер> <причина>")
+@commands.guild_only()
+@is_allowed()
+async def warn_cmd(ctx: commands.Context, member: discord.Member, *, reason: str = "не указана"):
+    if member == ctx.author:
+        await ctx.reply("Себя предупреждать не надо 🙂")
+        return
+    if member.bot:
+        await ctx.reply("Ботам варны не выдают.")
+        return
+
+    await db.warn_add(ctx.guild.id, member.id, ctx.author.id, reason)
+    count = await db.warns_count(ctx.guild.id, member.id)
+
+    mute_msg = ""
+    if count >= WARN_LIMIT_FOR_MUTE:
+        delta = parse_duration(WARN_MUTE_DURATION)
+        if delta:
+            try:
+                await member.timeout(delta, reason=f"Автомут за {count} предупреждений")
+                expires_at = datetime.now(timezone.utc) + delta
+                await db.mute_add(ctx.guild.id, member.id, bot.user.id, f"Автомут ({count} варнов)", expires_at)
+                mute_msg = f"\n🤖 **Автомут:** пользователь замучен на {WARN_MUTE_DURATION} за {count} предупреждений."
+            except Exception as e:
+                log.exception("Ошибка автомута")
+                mute_msg = f"\n⚠️ Не удалось выдать автомут: {e}"
+
+    await ctx.reply(
+        f"⚠️ {member.mention} получил предупреждение. Причина: {reason}\n"
+        f"Всего предупреждений: **{count}/{WARN_LIMIT_FOR_MUTE}**{mute_msg}"
+    )
+    await log_action(ctx, f"warn → {member} ({member.id})", f"причина: {reason} (всего: {count})")
+
+
+@bot.hybrid_command(name="warns", description="Показать активные варны юзера: !warns <юзер>")
+@commands.guild_only()
+@is_allowed()
+async def warns_cmd(ctx: commands.Context, member: discord.Member):
+    rows = await db.warns_active(ctx.guild.id, member.id)
+    if not rows:
+        await ctx.reply(f"У {member.mention} нет активных предупреждений.")
+        return
+
+    lines = [f"**Предупреждения {member.mention}** (всего: {len(rows)}):"]
+    for row in rows:
+        lines.append(
+            f"• `#{row['id']}` — {row['reason']} — "
+            f"мод: <@{row['moderator_id']}> — {fmt_dt(row['created_at'])}"
+        )
+    await ctx.reply("\n".join(lines))
+
+
+@bot.hybrid_command(name="unwarn", description="Снять варн по ID: !unwarn <юзер> <id_варна>")
+@commands.guild_only()
+@is_allowed()
+async def unwarn_cmd(ctx: commands.Context, member: discord.Member, warn_id: int):
+    rows = await db.warns_active(ctx.guild.id, member.id)
+    if not any(r["id"] == warn_id for r in rows):
+        await ctx.reply("Активный варн с таким ID не найден у этого пользователя.")
+        return
+    
+    await db.warn_remove(ctx.guild.id, member.id, warn_id)
+    await ctx.reply(f"✅ Варн `#{warn_id}` снят с {member.mention}.")
+    await log_action(ctx, f"unwarn → {member} ({member.id})", f"снят варн #{warn_id}")
+
+
+@bot.hybrid_command(name="clearwarns", description="Снять ВСЕ варны с пользователя: !clearwarns <юзер>")
+@commands.guild_only()
+@is_allowed()
+async def clearwarns_cmd(ctx: commands.Context, member: discord.Member):
+    rows = await db.warns_active(ctx.guild.id, member.id)
+    if not rows:
+        await ctx.reply(f"У {member.mention} и так нет активных варнов.")
+        return
+
+    await db.warns_clear(ctx.guild.id, member.id)
+    await ctx.reply(f"🗑 Все варны ({len(rows)} шт.) сняты с {member.mention}.")
+    await log_action(ctx, f"clearwarns → {member} ({member.id})", f"снято {len(rows)} шт.")
 
 
 bot.launch_time = datetime.now(timezone.utc)
